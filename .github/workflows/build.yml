@@ -64,12 +64,11 @@ jobs:
           
           val="${{ steps.checkTag.outputs.exists }}"
 
-          [[ "${{ env.latest_tag }}" == *"rc"* ]] && beta="true"
-          [[ "${{ env.latest_tag }}" == *"beta"* ]] && beta="true"
+          [[ "${{ env.latest_tag }}" == *"rc"* ]] && val="true"
+          [[ "${{ env.latest_tag }}" == *"beta"* ]] && val="true"
           [[ "${{ env.latest_tag }}" == *"test"* ]] && val="true"
           [[ "${{ env.latest_tag }}" == *"alpha"* ]] && val="true"
 
-          echo "beta=${beta}" >> $GITHUB_ENV
           echo "exists=${val}" >> $GITHUB_ENV
       -
         name: Send mail
