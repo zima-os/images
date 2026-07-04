@@ -72,6 +72,15 @@ jobs:
           echo "beta=${beta}" >> $GITHUB_ENV
           echo "exists=${val}" >> $GITHUB_ENV
       -
-        name: Cancel workflow
+        name: Send mail
         if: env.exists == 'false'
-        uses: action-pack/cancel@v1      
+        uses: action-pack/send-mail@v1
+        with:
+          to: ${{secrets.MAILTO}}
+          from: Github Actions <${{secrets.MAILTO}}>
+          connection_url: ${{secrets.MAIL_CONNECTION}}
+          subject: ZimaOS ${{ env.latest_tag }} was released
+          body: |
+              ZimaOS ${{ env.latest_tag }} was released!
+              
+              See https://github.com/${{ github.repository }} for more information.
