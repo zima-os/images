@@ -135,34 +135,13 @@ jobs:
             ' <<< "$release" | head -n 1
           )
 
-          img_name=$(
-            jq -r '
-              .assets[]
-              | select(.name | endswith("_installer.img"))
-              | .name
-            ' <<< "$release" | head -n 1
-          )
-
           if [ -z "$iso_name" ]; then
             echo "Installer ISO was not found in upstream release $latest_tag." >&2
             exit 1
           fi
 
-          if [ -z "$img_name" ]; then
-            echo "Installer IMG was not found in upstream release $latest_tag." >&2
-            exit 1
-          fi
-
           iso_url=$(
             jq -r --arg name "$iso_name" '
-              .assets[]
-              | select(.name == $name)
-              | .browser_download_url
-            ' <<< "$release"
-          )
-
-          img_url=$(
-            jq -r --arg name "$img_name" '
               .assets[]
               | select(.name == $name)
               | .browser_download_url
@@ -177,18 +156,15 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$img_url" ]; then
-            echo "Failed to determine the installer IMG URL." >&2
-            exit 1
-          fi
-
           [ -n "$release_title" ] || release_title="ZimaOS $latest_tag"
+
+          output_name="${iso_name%_installer.iso}.iso"
 
           printf '%s\n' "$release_body" > release-notes.md
 
           echo "release_title=$release_title" >> "$GITHUB_ENV"
           echo "iso_name=$iso_name" >> "$GITHUB_ENV"
-          echo "img_name=$img_name" >> "$GITHUB_ENV"
+          echo "output_name=$output_name" >> "$GITHUB_ENV"
 
           echo "Downloading $iso_name..."
 
@@ -200,18 +176,7 @@ jobs:
             --output "$iso_name" \
             "$iso_url"
 
-          echo "Downloading $img_name..."
-
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-all-errors \
-            --output "$img_name" \
-            "$img_url"
-
           test -s "$iso_name"
-          test -s "$img_name"
 
       -
         name: Create unattended installer ISO
@@ -222,7 +187,7 @@ jobs:
 
           work="$RUNNER_TEMP/zima-autoinstall"
           original_iso="$GITHUB_WORKSPACE/$iso_name"
-          output_iso="$GITHUB_WORKSPACE/$iso_name"
+          output_iso="$GITHUB_WORKSPACE/$output_name"
 
           rm -rf "$work"
 
@@ -359,10 +324,8 @@ jobs:
 
           echo "Rebuilding ISO..."
 
-          mv "$original_iso" "$work/original.iso"
-
           xorriso \
-            -indev "$work/original.iso" \
+            -indev "$original_iso" \
             -outdev "$output_iso" \
             -boot_image any replay \
             -map "$work/initrd-autoinstall.gz" /install.amd/initrd \
@@ -416,10 +379,12 @@ jobs:
           echo "ISO verification completed successfully."
 
           printf 'Original ISO: '
-          du -h "$work/original.iso" | cut -f1
+          du -h "$original_iso" | cut -f1
 
           printf 'Patched ISO:  '
           du -h "$output_iso" | cut -f1
+
+          rm -f "$original_iso"
 
       -
         name: Publish release
@@ -430,16 +395,14 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          test -s "$iso_name"
-          test -s "$img_name"
+          test -s "$output_name"
           test -s release-notes.md
 
           gh release create "v${latest_tag}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$release_title" \
             --notes-file release-notes.md \
-            "$iso_name" \
-            "$img_name"
+            "$output_name"
 
       -
         name: Send mail
