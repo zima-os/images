@@ -68,14 +68,6 @@ jobs:
 
           latest_tag="${latest_tag#v}"
 
-          case "${latest_tag,,}" in
-            *alpha*|*beta*|*test*|*rc*)
-              echo "Skipping prerelease tag: $latest_tag"
-              echo "skip=true" >> "$GITHUB_ENV"
-              exit 0
-              ;;
-          esac
-
           latest_version="${latest_tag%%-*}"
           major="${latest_version%%.*}"
           minor="${latest_version#*.}"
@@ -98,8 +90,10 @@ jobs:
           set -Eeuo pipefail
 
           if gh release view "v${latest_tag}" >/dev/null 2>&1; then
+            echo "Release v${latest_tag} already exists."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
+            echo "Release v${latest_tag} does not exist."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -149,6 +143,16 @@ jobs:
             ' <<< "$release" | head -n 1
           )
 
+          if [ -z "$iso_name" ]; then
+            echo "Installer ISO was not found in upstream release $latest_tag." >&2
+            exit 1
+          fi
+
+          if [ -z "$img_name" ]; then
+            echo "Installer IMG was not found in upstream release $latest_tag." >&2
+            exit 1
+          fi
+
           iso_url=$(
             jq -r --arg name "$iso_name" '
               .assets[]
@@ -165,26 +169,28 @@ jobs:
             ' <<< "$release"
           )
 
-          title=$(jq -r '.name // empty' <<< "$release")
-          body=$(jq -r '.body // empty' <<< "$release")
+          release_title=$(jq -r '.name // empty' <<< "$release")
+          release_body=$(jq -r '.body // empty' <<< "$release")
 
-          if [ -z "$iso_name" ] || [ -z "$iso_url" ]; then
-            echo "Installer ISO was not found in upstream release $latest_tag." >&2
+          if [ -z "$iso_url" ]; then
+            echo "Failed to determine the installer ISO URL." >&2
             exit 1
           fi
 
-          if [ -z "$img_name" ] || [ -z "$img_url" ]; then
-            echo "Installer IMG was not found in upstream release $latest_tag." >&2
+          if [ -z "$img_url" ]; then
+            echo "Failed to determine the installer IMG URL." >&2
             exit 1
           fi
 
-          [ -n "$title" ] || title="ZimaOS $latest_tag"
+          [ -n "$release_title" ] || release_title="ZimaOS $latest_tag"
 
-          printf '%s\n' "$body" > release-notes.md
+          printf '%s\n' "$release_body" > release-notes.md
 
-          echo "release_title=$title" >> "$GITHUB_ENV"
+          echo "release_title=$release_title" >> "$GITHUB_ENV"
           echo "iso_name=$iso_name" >> "$GITHUB_ENV"
           echo "img_name=$img_name" >> "$GITHUB_ENV"
+
+          echo "Downloading $iso_name..."
 
           curl \
             --fail \
@@ -193,6 +199,8 @@ jobs:
             --retry-all-errors \
             --output "$iso_name" \
             "$iso_url"
+
+          echo "Downloading $img_name..."
 
           curl \
             --fail \
@@ -217,7 +225,10 @@ jobs:
           output_iso="$GITHUB_WORKSPACE/$iso_name"
 
           rm -rf "$work"
-          mkdir -p "$work/initramfs"
+
+          mkdir -p \
+            "$work/initramfs" \
+            "$work/verify/initramfs"
 
           echo "Extracting initramfs and GRUB configuration..."
 
@@ -227,22 +238,31 @@ jobs:
             -extract /install.amd/initrd "$work/initrd.gz" \
             -extract /boot/grub/grub.cfg "$work/grub.cfg"
 
+          test -s "$work/initrd.gz"
+          test -s "$work/grub.cfg"
+
           echo "Unpacking initramfs..."
 
           gzip -dc "$work/initrd.gz" |
             (
               cd "$work/initramfs"
-              cpio -idm \
+
+              sudo cpio \
+                -idm \
                 --quiet \
                 --no-absolute-filenames
             )
 
-          if [ ! -x "$work/initramfs/usr/bin/whiptail" ]; then
+          sudo chown -R \
+            "$(id -u):$(id -g)" \
+            "$work/initramfs"
+
+          if [ ! -e "$work/initramfs/usr/bin/whiptail" ]; then
             echo "The expected whiptail executable was not found." >&2
             exit 1
           fi
 
-          if [ ! -x "$work/initramfs/usr/bin/installer" ]; then
+          if [ ! -e "$work/initramfs/usr/bin/installer" ]; then
             echo "The expected ZimaOS installer was not found." >&2
             exit 1
           fi
@@ -303,13 +323,19 @@ jobs:
             printf '%s\n' \
               'set default=0' \
               'set timeout=0'
+
             cat "$work/grub.cfg"
           } > "$work/grub-autoinstall.cfg"
 
           echo "Repacking initramfs..."
 
-          (
-            cd "$work/initramfs"
+          sudo bash -c '
+            set -Eeuo pipefail
+
+            source_dir="$1"
+            destination="$2"
+
+            cd "$source_dir"
 
             find . -print0 |
               LC_ALL=C sort -z |
@@ -319,8 +345,17 @@ jobs:
                 --format=newc \
                 --owner=0:0 \
                 --quiet |
-              gzip -9n > "$work/initrd-autoinstall.gz"
-          )
+              gzip -9n > "$destination"
+          ' _ \
+            "$work/initramfs" \
+            "$work/initrd-autoinstall.gz"
+
+          sudo chown \
+            "$(id -u):$(id -g)" \
+            "$work/initrd-autoinstall.gz"
+
+          gzip -t "$work/initrd-autoinstall.gz"
+          test -s "$work/initrd-autoinstall.gz"
 
           echo "Rebuilding ISO..."
 
@@ -338,8 +373,6 @@ jobs:
 
           echo "Verifying patched ISO..."
 
-          mkdir -p "$work/verify"
-
           xorriso \
             -osirrox on \
             -indev "$output_iso" \
@@ -348,8 +381,39 @@ jobs:
 
           gzip -t "$work/verify/initrd.gz"
 
-          grep -Fxq 'set default=0' "$work/verify/grub.cfg"
-          grep -Fxq 'set timeout=0' "$work/verify/grub.cfg"
+          grep -Fxq \
+            'set default=0' \
+            "$work/verify/grub.cfg"
+
+          grep -Fxq \
+            'set timeout=0' \
+            "$work/verify/grub.cfg"
+
+          echo "Verifying automatic prompt handler..."
+
+          gzip -dc "$work/verify/initrd.gz" |
+            (
+              cd "$work/verify/initramfs"
+
+              sudo cpio \
+                -idm \
+                --quiet \
+                --no-absolute-filenames
+            )
+
+          grep -Fq \
+            'QUICK INSTALL MENU' \
+            "$work/verify/initramfs/usr/bin/whiptail"
+
+          grep -Fq \
+            'printf '\''%s\n'\'' "/dev/sda"' \
+            "$work/verify/initramfs/usr/bin/whiptail"
+
+          test -e \
+            "$work/verify/initramfs/usr/bin/whiptail.real"
+
+          echo
+          echo "ISO verification completed successfully."
 
           printf 'Original ISO: '
           du -h "$work/original.iso" | cut -f1
@@ -365,6 +429,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
+
+          test -s "$iso_name"
+          test -s "$img_name"
+          test -s release-notes.md
 
           gh release create "v${latest_tag}" \
             --title "$release_title" \
