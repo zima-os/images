@@ -1,4 +1,5 @@
 name: Build
+
 on:
   workflow_dispatch:
   schedule:
@@ -12,13 +13,15 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+
     permissions:
       actions: write
       packages: write
-      contents: read
+      contents: write
+
     steps:
-      - 
-        name: Run graphql query to get tag
+      -
+        name: Run GraphQL query to get tag
         uses: octokit/graphql-action@v3.x
         id: latest_tag
         with:
@@ -28,58 +31,357 @@ jobs:
           query: |
             query tag($owner: String!, $repo: String!) {
               repository(owner: $owner, name: $repo) {
-                refs(refPrefix: "refs/tags/", last: 1, orderBy: {field: TAG_COMMIT_DATE, direction: ASC}) {
+                refs(
+                  refPrefix: "refs/tags/"
+                  last: 1
+                  orderBy: {
+                    field: TAG_COMMIT_DATE
+                    direction: ASC
+                  }
+                ) {
                   edges {
                     node {
                       name
-               } } } } }
+                    }
+                  }
+                }
+              }
+            }
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - 
+
+      -
         name: Parse tag from query output
+        shell: bash
         run: |
-          #!/bin/bash
-          latest_tag=$(echo '${{ steps.latest_tag.outputs.data }}' | jq '.repository.refs.edges[][].name' -r)
-          [ -z "$latest_tag" ] && echo "Tag not found!" && exit 1
-          [[ "$latest_tag" == "null" ]] && echo "Tag not found!" && exit 1
-          [[ "$latest_tag" = v* ]] && latest_tag="${latest_tag:1}"
-          echo "Found tag: \"${latest_tag}\"" 
-          latest_version="${latest_tag%-*}"
+          set -Eeuo pipefail
+
+          latest_tag=$(
+            jq -r '.repository.refs.edges[0].node.name // empty' \
+              <<< '${{ steps.latest_tag.outputs.data }}'
+          )
+
+          if [ -z "$latest_tag" ]; then
+            echo "Tag not found!" >&2
+            exit 1
+          fi
+
+          latest_tag="${latest_tag#v}"
+
+          case "${latest_tag,,}" in
+            *alpha*|*beta*|*test*|*rc*)
+              echo "Skipping prerelease tag: $latest_tag"
+              echo "skip=true" >> "$GITHUB_ENV"
+              exit 0
+              ;;
+          esac
+
+          latest_version="${latest_tag%%-*}"
           major="${latest_version%%.*}"
           minor="${latest_version#*.}"
           minor="${minor%%.*}"
-          echo "latest_tag=$latest_tag" >> $GITHUB_ENV
-          echo "latest_minor=$major.$minor" >> $GITHUB_ENV
-      - 
-        name: Check if the tag exists locally
-        uses: action-pack/tag-exists@v1
-        id: checkTag
-        with: 
-          tag: 'v${{ env.latest_tag }}'
+
+          echo "Found tag: \"$latest_tag\""
+
+          echo "skip=false" >> "$GITHUB_ENV"
+          echo "latest_tag=$latest_tag" >> "$GITHUB_ENV"
+          echo "latest_minor=$major.$minor" >> "$GITHUB_ENV"
+
       -
-        name: Finish when found
+        name: Check if release exists
+        if: env.skip == 'false'
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          #!/bin/bash
-          beta="false"
-          
-          val="${{ steps.checkTag.outputs.exists }}"
+          set -Eeuo pipefail
 
-          [[ "${{ env.latest_tag }}" == *"rc"* ]] && val="true"
-          [[ "${{ env.latest_tag }}" == *"beta"* ]] && val="true"
-          [[ "${{ env.latest_tag }}" == *"test"* ]] && val="true"
-          [[ "${{ env.latest_tag }}" == *"alpha"* ]] && val="true"
+          if gh release view "v${latest_tag}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
-          echo "exists=${val}" >> $GITHUB_ENV
+      -
+        name: Install build dependencies
+        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cpio \
+            gzip \
+            xorriso
+
+      -
+        name: Download upstream release
+        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          upstream="IceWhaleTech/ZimaOS"
+
+          release=$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$upstream/releases/tags/$latest_tag"
+          )
+
+          iso_name=$(
+            jq -r '
+              .assets[]
+              | select(.name | endswith("_installer.iso"))
+              | .name
+            ' <<< "$release" | head -n 1
+          )
+
+          img_name=$(
+            jq -r '
+              .assets[]
+              | select(.name | endswith("_installer.img"))
+              | .name
+            ' <<< "$release" | head -n 1
+          )
+
+          iso_url=$(
+            jq -r --arg name "$iso_name" '
+              .assets[]
+              | select(.name == $name)
+              | .browser_download_url
+            ' <<< "$release"
+          )
+
+          img_url=$(
+            jq -r --arg name "$img_name" '
+              .assets[]
+              | select(.name == $name)
+              | .browser_download_url
+            ' <<< "$release"
+          )
+
+          title=$(jq -r '.name // empty' <<< "$release")
+          body=$(jq -r '.body // empty' <<< "$release")
+
+          if [ -z "$iso_name" ] || [ -z "$iso_url" ]; then
+            echo "Installer ISO was not found in upstream release $latest_tag." >&2
+            exit 1
+          fi
+
+          if [ -z "$img_name" ] || [ -z "$img_url" ]; then
+            echo "Installer IMG was not found in upstream release $latest_tag." >&2
+            exit 1
+          fi
+
+          [ -n "$title" ] || title="ZimaOS $latest_tag"
+
+          printf '%s\n' "$body" > release-notes.md
+
+          echo "release_title=$title" >> "$GITHUB_ENV"
+          echo "iso_name=$iso_name" >> "$GITHUB_ENV"
+          echo "img_name=$img_name" >> "$GITHUB_ENV"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --output "$iso_name" \
+            "$iso_url"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --output "$img_name" \
+            "$img_url"
+
+          test -s "$iso_name"
+          test -s "$img_name"
+
+      -
+        name: Create unattended installer ISO
+        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          work="$RUNNER_TEMP/zima-autoinstall"
+          original_iso="$GITHUB_WORKSPACE/$iso_name"
+          output_iso="$GITHUB_WORKSPACE/$iso_name"
+
+          rm -rf "$work"
+          mkdir -p "$work/initramfs"
+
+          echo "Extracting initramfs and GRUB configuration..."
+
+          xorriso \
+            -osirrox on \
+            -indev "$original_iso" \
+            -extract /install.amd/initrd "$work/initrd.gz" \
+            -extract /boot/grub/grub.cfg "$work/grub.cfg"
+
+          echo "Unpacking initramfs..."
+
+          gzip -dc "$work/initrd.gz" |
+            (
+              cd "$work/initramfs"
+              cpio -idm \
+                --quiet \
+                --no-absolute-filenames
+            )
+
+          if [ ! -x "$work/initramfs/usr/bin/whiptail" ]; then
+            echo "The expected whiptail executable was not found." >&2
+            exit 1
+          fi
+
+          if [ ! -x "$work/initramfs/usr/bin/installer" ]; then
+            echo "The expected ZimaOS installer was not found." >&2
+            exit 1
+          fi
+
+          echo "Installing automatic prompt handler..."
+
+          mv \
+            "$work/initramfs/usr/bin/whiptail" \
+            "$work/initramfs/usr/bin/whiptail.real"
+
+          cat > "$work/initramfs/usr/bin/whiptail" <<'EOF'
+          #!/bin/sh
+
+          arguments="$*"
+
+          case "$arguments" in
+            *"--gauge"*)
+              cat >/dev/null
+              exit 0
+              ;;
+
+            *"--yesno"*)
+              exit 0
+              ;;
+
+            *"--menu"*"QUICK INSTALL MENU"*)
+              printf '%s\n' "/dev/sda" >&2
+              exit 0
+              ;;
+
+            *"--menu"*"Install Demo Data"*)
+              printf '%s\n' "2" >&2
+              exit 0
+              ;;
+
+            *"--menu"*)
+              printf '%s\n' "1" >&2
+              exit 0
+              ;;
+
+            *"--msgbox"*"Installation done"*)
+              sync
+              poweroff -f
+              exit 0
+              ;;
+
+            *)
+              exec /usr/bin/whiptail.real "$@"
+              ;;
+          esac
+          EOF
+
+          chmod 755 "$work/initramfs/usr/bin/whiptail"
+
+          echo "Configuring immediate GRUB startup..."
+
+          {
+            printf '%s\n' \
+              'set default=0' \
+              'set timeout=0'
+            cat "$work/grub.cfg"
+          } > "$work/grub-autoinstall.cfg"
+
+          echo "Repacking initramfs..."
+
+          (
+            cd "$work/initramfs"
+
+            find . -print0 |
+              LC_ALL=C sort -z |
+              cpio \
+                --null \
+                --create \
+                --format=newc \
+                --owner=0:0 \
+                --quiet |
+              gzip -9n > "$work/initrd-autoinstall.gz"
+          )
+
+          echo "Rebuilding ISO..."
+
+          mv "$original_iso" "$work/original.iso"
+
+          xorriso \
+            -indev "$work/original.iso" \
+            -outdev "$output_iso" \
+            -boot_image any replay \
+            -map "$work/initrd-autoinstall.gz" /install.amd/initrd \
+            -map "$work/grub-autoinstall.cfg" /boot/grub/grub.cfg \
+            -commit
+
+          test -s "$output_iso"
+
+          echo "Verifying patched ISO..."
+
+          mkdir -p "$work/verify"
+
+          xorriso \
+            -osirrox on \
+            -indev "$output_iso" \
+            -extract /install.amd/initrd "$work/verify/initrd.gz" \
+            -extract /boot/grub/grub.cfg "$work/verify/grub.cfg"
+
+          gzip -t "$work/verify/initrd.gz"
+
+          grep -Fxq 'set default=0' "$work/verify/grub.cfg"
+          grep -Fxq 'set timeout=0' "$work/verify/grub.cfg"
+
+          printf 'Original ISO: '
+          du -h "$work/original.iso" | cut -f1
+
+          printf 'Patched ISO:  '
+          du -h "$output_iso" | cut -f1
+
+      -
+        name: Publish release
+        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          gh release create "v${latest_tag}" \
+            --title "$release_title" \
+            --notes-file release-notes.md \
+            "$iso_name" \
+            "$img_name"
+
       -
         name: Send mail
-        if: env.exists == 'false'
+        if: env.skip == 'false' && steps.release.outputs.exists == 'false' && success()
         uses: action-pack/send-mail@v1
         with:
-          to: ${{secrets.MAILTO}}
-          from: Github Actions <${{secrets.MAILTO}}>
-          connection_url: ${{secrets.MAIL_CONNECTION}}
+          to: ${{ secrets.MAILTO }}
+          from: GitHub Actions <${{ secrets.MAILTO }}>
+          connection_url: ${{ secrets.MAIL_CONNECTION }}
           subject: ZimaOS ${{ env.latest_tag }} was released
           body: |
-              ZimaOS ${{ env.latest_tag }} was released!
-              
-              See https://github.com/${{ github.repository }} for more information.
+            ZimaOS ${{ env.latest_tag }} was released and its automatic installer was published.
+
+            See https://github.com/${{ github.repository }}/releases/tag/v${{ env.latest_tag }}
