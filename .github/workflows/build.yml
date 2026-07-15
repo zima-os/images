@@ -253,22 +253,33 @@ jobs:
               exit 0
               ;;
 
-            *"--menu"*"QUICK INSTALL MENU"*)
-              printf '%s\n' "/dev/sda" >&2
-              exit 0
+            *"QUICK INSTALL MENU"*)
+              for argument in "$@"; do
+                case "$argument" in
+                  /dev/sd*|/dev/mmcblk*|/dev/nvme*)
+                    if [ -b "$argument" ]; then
+                      printf '%s\n' "$argument" >&2
+                      exit 0
+                    fi
+                    ;;
+                esac
+              done
+
+              echo "No installation target was found." >&2
+              exit 1
               ;;
 
-            *"--menu"*"Install Demo Data"*)
+            *"Install Demo Data"*)
               printf '%s\n' "2" >&2
               exit 0
               ;;
 
-            *"--menu"*)
+            *"MAIN MENU"*)
               printf '%s\n' "1" >&2
               exit 0
               ;;
 
-            *"--msgbox"*"Installation done"*)
+            *"Installation done"*|*"You may now remove the install media and reboot."*)
               sync
               poweroff -f
               exit 0
@@ -369,7 +380,15 @@ jobs:
             "$work/verify/initramfs/usr/bin/whiptail"
 
           grep -Fq \
-            'printf '\''%s\n'\'' "/dev/sda"' \
+            '/dev/sd*|/dev/mmcblk*|/dev/nvme*' \
+            "$work/verify/initramfs/usr/bin/whiptail"
+
+          grep -Fq \
+            'No installation target was found.' \
+            "$work/verify/initramfs/usr/bin/whiptail"
+
+          grep -Fq \
+            'poweroff -f' \
             "$work/verify/initramfs/usr/bin/whiptail"
 
           test -e \
