@@ -75,13 +75,11 @@ jobs:
 
           echo "Found tag: \"$latest_tag\""
 
-          echo "skip=false" >> "$GITHUB_ENV"
           echo "latest_tag=$latest_tag" >> "$GITHUB_ENV"
           echo "latest_minor=$major.$minor" >> "$GITHUB_ENV"
 
       -
         name: Check if release exists
-        if: env.skip == 'false'
         id: release
         shell: bash
         env:
@@ -89,7 +87,9 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          if gh release view "v${latest_tag}" >/dev/null 2>&1; then
+          if gh release view "v${latest_tag}" \
+            --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1; then
             echo "Release v${latest_tag} already exists."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
@@ -99,7 +99,7 @@ jobs:
 
       -
         name: Install build dependencies
-        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        if: steps.release.outputs.exists == 'false'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -112,7 +112,7 @@ jobs:
 
       -
         name: Download upstream release
-        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        if: steps.release.outputs.exists == 'false'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -215,7 +215,7 @@ jobs:
 
       -
         name: Create unattended installer ISO
-        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        if: steps.release.outputs.exists == 'false'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -423,7 +423,7 @@ jobs:
 
       -
         name: Publish release
-        if: env.skip == 'false' && steps.release.outputs.exists == 'false'
+        if: steps.release.outputs.exists == 'false'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -435,6 +435,7 @@ jobs:
           test -s release-notes.md
 
           gh release create "v${latest_tag}" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$release_title" \
             --notes-file release-notes.md \
             "$iso_name" \
@@ -442,7 +443,7 @@ jobs:
 
       -
         name: Send mail
-        if: env.skip == 'false' && steps.release.outputs.exists == 'false' && success()
+        if: steps.release.outputs.exists == 'false' && success()
         uses: action-pack/send-mail@v1
         with:
           to: ${{ secrets.MAILTO }}
