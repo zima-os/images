@@ -244,11 +244,6 @@ jobs:
           arguments="$*"
 
           case "$arguments" in
-            *"--gauge"*)
-              cat >/dev/null
-              exit 0
-              ;;
-
             *"--yesno"*)
               exit 0
               ;;
@@ -281,7 +276,7 @@ jobs:
 
             *"Installation done"*|*"You may now remove the install media and reboot."*)
               sync
-              poweroff -f
+              reboot -f
               exit 0
               ;;
 
@@ -388,8 +383,15 @@ jobs:
             "$work/verify/initramfs/usr/bin/whiptail"
 
           grep -Fq \
-            'poweroff -f' \
+            'reboot -f' \
             "$work/verify/initramfs/usr/bin/whiptail"
+
+          if grep -Fq \
+            '*"--gauge"*)' \
+            "$work/verify/initramfs/usr/bin/whiptail"; then
+            echo "The automatic prompt handler still intercepts progress gauges." >&2
+            exit 1
+          fi
 
           test -e \
             "$work/verify/initramfs/usr/bin/whiptail.real"
