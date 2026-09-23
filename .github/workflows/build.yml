@@ -21,48 +21,24 @@ jobs:
 
     steps:
       -
-        name: Run GraphQL query to get tag
-        uses: octokit/graphql-action@v3.x
-        id: latest_tag
-        with:
-          variables: |
-            repo: ZimaOS
-            owner: IceWhaleTech
-          query: |
-            query tag($owner: String!, $repo: String!) {
-              repository(owner: $owner, name: $repo) {
-                refs(
-                  refPrefix: "refs/tags/"
-                  last: 1
-                  orderBy: {
-                    field: TAG_COMMIT_DATE
-                    direction: ASC
-                  }
-                ) {
-                  edges {
-                    node {
-                      name
-                    }
-                  }
-                }
-              }
-            }
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      -
-        name: Parse tag from query output
+        name: Get latest upstream release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
 
+          upstream="IceWhaleTech/ZimaOS"
+
           latest_tag=$(
-            jq -r '.repository.refs.edges[0].node.name // empty' \
-              <<< '${{ steps.latest_tag.outputs.data }}'
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$upstream/releases?per_page=100" \
+              --jq '[.[] | select(.draft == false)][0].tag_name // empty'
           )
 
           if [ -z "$latest_tag" ]; then
-            echo "Tag not found!" >&2
+            echo "Release not found!" >&2
             exit 1
           fi
 
@@ -73,7 +49,7 @@ jobs:
           minor="${latest_version#*.}"
           minor="${minor%%.*}"
 
-          echo "Found tag: \"$latest_tag\""
+          echo "Found release: \"$latest_tag\""
 
           echo "latest_tag=$latest_tag" >> "$GITHUB_ENV"
           echo "latest_minor=$major.$minor" >> "$GITHUB_ENV"
