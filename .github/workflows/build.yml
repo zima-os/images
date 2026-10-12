@@ -82,9 +82,15 @@ jobs:
 
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            bzip2 \
             cpio \
             gzip \
-            xorriso
+            lz4 \
+            lzop \
+            python3 \
+            xorriso \
+            xz-utils \
+            zstd
 
       -
         name: Download upstream release
@@ -176,23 +182,116 @@ jobs:
           xorriso \
             -osirrox on \
             -indev "$original_iso" \
-            -extract /install.amd/initrd "$work/initrd.gz" \
+            -extract /install.amd/initrd "$work/initrd" \
             -extract /boot/grub/grub.cfg "$work/grub.cfg"
 
-          test -s "$work/initrd.gz"
+          test -s "$work/initrd"
           test -s "$work/grub.cfg"
 
           echo "Unpacking initramfs..."
 
-          gzip -dc "$work/initrd.gz" |
-            (
-              cd "$work/initramfs"
+          split_initramfs() {
+            python3 - "$@" <<'PYTHON'
+          import pathlib
+          import sys
 
-              sudo cpio \
-                -idm \
-                --quiet \
-                --no-absolute-filenames
-            )
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          offset = 0
+          archives = []
+
+          # Locate the main archive without changing any early CPIO archives.
+          while True:
+              while offset < len(data) and data[offset] == 0:
+                  offset += 1
+              if data[offset:offset + 6] not in (b"070701", b"070702"):
+                  break
+              start = offset
+              while True:
+                  header = data[offset:offset + 110]
+                  if len(header) != 110 or header[:6] not in (b"070701", b"070702"):
+                      sys.exit("Invalid or truncated initramfs CPIO header.")
+                  try:
+                      file_size = int(header[54:62], 16)
+                      name_size = int(header[94:102], 16)
+                  except ValueError:
+                      sys.exit("Invalid initramfs CPIO size field.")
+                  name_end = offset + 110 + name_size
+                  if name_size < 1 or name_end > len(data):
+                      sys.exit("Invalid or truncated initramfs CPIO filename.")
+                  name = data[offset + 110:name_end]
+                  if not name.endswith(b"\0"):
+                      sys.exit("Invalid initramfs CPIO filename terminator.")
+                  offset = (name_end + 3) & ~3
+                  offset = (offset + file_size + 3) & ~3
+                  if offset > len(data):
+                      sys.exit("Truncated initramfs CPIO file data.")
+                  if name.rstrip(b"\0") == b"TRAILER!!!":
+                      break
+              archives.append(start)
+
+          if offset == len(data) and archives:
+              offset = archives[-1]
+              compression = "cpio"
+          else:
+              formats = (
+                  (b"\x1f\x8b", "gzip"),
+                  (b"\xfd7zXZ\x00", "xz"),
+                  (b"\x28\xb5\x2f\xfd", "zstd"),
+                  (b"BZh", "bzip2"),
+                  (b"\x02\x21\x4c\x18", "lz4"),
+                  (b"\x04\x22\x4d\x18", "lz4-frame"),
+                  (b"\x89LZO\x00\x0d\x0a\x1a\x0a", "lzo"),
+                  (b"\x5d\x00", "lzma"),
+                  (b"\x6d\x00", "lzma"),
+              )
+              compression = next(
+                  (kind for magic, kind in formats if data.startswith(magic, offset)),
+                  None,
+              )
+              if compression is None:
+                  sys.exit("Unsupported initramfs format: " + data[offset:offset + 16].hex())
+
+          pathlib.Path(sys.argv[2]).write_bytes(data[:offset])
+          pathlib.Path(sys.argv[3]).write_bytes(data[offset:])
+          print(compression)
+          PYTHON
+          }
+
+          decompress_initramfs() {
+            case "$1" in
+              gzip) gzip -dc ;;
+              xz) xz -dc ;;
+              zstd) zstd -q -dc ;;
+              bzip2) bzip2 -dc ;;
+              lz4|lz4-frame) lz4 -dc ;;
+              lzo) lzop -dc ;;
+              lzma) xz --format=lzma -dc ;;
+              cpio) cat ;;
+              *) echo "Unsupported initramfs compression: $1" >&2; return 1 ;;
+            esac < "$2"
+          }
+
+          initrd_format=$(
+            split_initramfs \
+              "$work/initrd" \
+              "$work/initrd-prefix" \
+              "$work/initrd-main"
+          )
+
+          echo "Detected initramfs compression: $initrd_format"
+
+          decompress_initramfs \
+            "$initrd_format" \
+            "$work/initrd-main" > "$work/initrd-main.cpio"
+
+          (
+            cd "$work/initramfs"
+
+            sudo cpio \
+              -idm \
+              --quiet \
+              --no-absolute-filenames < "$work/initrd-main.cpio"
+          )
 
           sudo chown -R \
             "$(id -u):$(id -g)" \
@@ -282,6 +381,19 @@ jobs:
             source_dir="$1"
             destination="$2"
 
+            case "$3" in
+              gzip) compressor=(gzip -9n) ;;
+              xz) compressor=(xz --check=crc32 -6 -c) ;;
+              zstd) compressor=(zstd -q -3 -c) ;;
+              bzip2) compressor=(bzip2 -9 -c) ;;
+              lz4) compressor=(lz4 -l -9 -c) ;;
+              lz4-frame) compressor=(lz4 -9 -c) ;;
+              lzo) compressor=(lzop -9 -c) ;;
+              lzma) compressor=(xz --format=lzma -6 -c) ;;
+              cpio) compressor=(cat) ;;
+              *) echo "Unsupported initramfs compression: $3" >&2; exit 1 ;;
+            esac
+
             cd "$source_dir"
 
             find . -print0 |
@@ -292,17 +404,25 @@ jobs:
                 --format=newc \
                 --owner=0:0 \
                 --quiet |
-              gzip -9n > "$destination"
+              "${compressor[@]}" > "$destination"
           ' _ \
             "$work/initramfs" \
-            "$work/initrd-autoinstall.gz"
+            "$work/initrd-autoinstall-main" \
+            "$initrd_format"
 
           sudo chown \
             "$(id -u):$(id -g)" \
-            "$work/initrd-autoinstall.gz"
+            "$work/initrd-autoinstall-main"
 
-          gzip -t "$work/initrd-autoinstall.gz"
-          test -s "$work/initrd-autoinstall.gz"
+          decompress_initramfs \
+            "$initrd_format" \
+            "$work/initrd-autoinstall-main" > /dev/null
+
+          cat \
+            "$work/initrd-prefix" \
+            "$work/initrd-autoinstall-main" > "$work/initrd-autoinstall"
+
+          test -s "$work/initrd-autoinstall"
 
           echo "Rebuilding ISO..."
 
@@ -310,7 +430,7 @@ jobs:
             -indev "$original_iso" \
             -outdev "$output_iso" \
             -boot_image any replay \
-            -map "$work/initrd-autoinstall.gz" /install.amd/initrd \
+            -map "$work/initrd-autoinstall" /install.amd/initrd \
             -map "$work/grub-autoinstall.cfg" /boot/grub/grub.cfg \
             -commit
 
@@ -321,10 +441,19 @@ jobs:
           xorriso \
             -osirrox on \
             -indev "$output_iso" \
-            -extract /install.amd/initrd "$work/verify/initrd.gz" \
+            -extract /install.amd/initrd "$work/verify/initrd" \
             -extract /boot/grub/grub.cfg "$work/verify/grub.cfg"
 
-          gzip -t "$work/verify/initrd.gz"
+          verify_format=$(
+            split_initramfs \
+              "$work/verify/initrd" \
+              "$work/verify/initrd-prefix" \
+              "$work/verify/initrd-main"
+          )
+
+          test "$verify_format" = "$initrd_format"
+          cmp -s "$work/initrd-prefix" "$work/verify/initrd-prefix"
+          cmp -s "$work/initrd-autoinstall-main" "$work/verify/initrd-main"
 
           grep -Fxq \
             'set default=0' \
@@ -336,7 +465,9 @@ jobs:
 
           echo "Verifying automatic prompt handler..."
 
-          gzip -dc "$work/verify/initrd.gz" |
+          decompress_initramfs \
+            "$verify_format" \
+            "$work/verify/initrd-main" |
             (
               cd "$work/verify/initramfs"
 
